@@ -9,6 +9,8 @@ const axios = require('axios');
 const { pipeline } = require('@xenova/transformers');
 const { chromium } = require('playwright');
 const { execSync } = require('child_process');
+const Groq = require('groq-sdk');
+const { exec } = require('child_process');
 
 const app = express();
 
@@ -19,45 +21,59 @@ const testDir = path.join(__dirname, 'generated-tests');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 if (!fs.existsSync(testDir)) fs.mkdirSync(testDir, { recursive: true });
 
-// Local Model Handler
-class LocalAnalyzer {
-  static model = null;
-  static modelDir = path.join(__dirname, 'model_cache');
+// Groq API Configuration
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-  static async initialize() {
+// Remote Model Handler
+class RemoteAnalyzer {
+  static async analyze(text) {
+    let completion;
     try {
-      if (!fs.existsSync(this.modelDir)) {
-        fs.mkdirSync(this.modelDir, { recursive: true });
-      }
+      completion = await groq.chat.completions.create({
+        messages: [{
+          role: "user",
+          content: `Generate Playwright test scripts from SRS text with these strict rules:
+1. NEVER include percentages like (0%) or (100%) in test names
+2. Test names should be descriptive but concise
+3. Structure tests properly with describe() blocks
+4. Include all necessary imports and assertions
 
-      console.log('Downloading local model...');
-      this.model = await pipeline('text-classification', {
-        model: 'Xenova/bart-large-mnli',
-        cache_dir: this.modelDir,
-        revision: 'main'
+Example of BAD naming (REJECT THIS FORMAT):
+test('functional requirement (75%)', ...)
+
+Example of GOOD naming (USE THIS FORMAT):
+test('Validate login functionality', ...)
+
+Generate only the test code with no percentages in names.`
+        }],
+        model: "llama3-70b-8192",
       });
-      console.log('Local model ready!');
-    } catch (err) {
-      console.error('Local model error:', err.message);
-      this.model = null;
+
+      // Post-process the response to remove any percentages that might slip through
+      let result = completion.choices[0]?.message?.content || "";
+      result = result.replace(/\(\d+%\)/g, ''); // Remove all (XX%) patterns
+      result = result.replace(/\s{2,}/g, ' ');  // Clean up extra spaces
+
+      const labels = ["functional requirement", "non-functional requirement", "use case", "constraint"];
+      const categories = labels.map(label => ({
+        label,
+        score: result.includes(label) ? 1 : 0
+      }));
+
+      return {
+        categories,
+        entities: extractEntities(text),
+        method: 'remote',
+        testScript: result
+      };
+
+    } catch (error) {
+      console.error("Error calling Groq API:", error);
+      throw new Error('Remote model failed');
     }
   }
-
-  static async analyze(text) {
-    if (!this.model) await this.initialize();
-    if (!this.model) throw new Error('Local model failed');
-    
-    return await this.model(text, {
-      candidate_labels: [
-        "functional requirement",
-        "non-functional requirement",
-        "use case",
-        "constraint"
-      ],
-      timeout: 10000
-    });
-  }
 }
+
 
 // MongoDB Schema
 const TestRunSchema = new mongoose.Schema({
@@ -69,12 +85,12 @@ const TestRunSchema = new mongoose.Schema({
     total: Number,
     applicationAvailable: Boolean
   },
-  details: [{
+  details: [ {
     title: String,
     status: String,
     duration: Number,
     error: String
-  }]
+  } ]
 });
 const TestRun = mongoose.model('TestRun', TestRunSchema);
 
@@ -149,46 +165,6 @@ function extractEntities(text) {
   return [...roles, ...systems];
 }
 
-// AI Analysis
-async function analyzeWithHuggingFace(text) {
-  if (!process.env.HF_TOKEN) throw new Error('API token missing');
-  try {
-    const res = await axios.post(
-      'https://api-inference.huggingface.co/models/facebook/bart-large-mnli',
-      { inputs: text, parameters: { candidate_labels: ["functional", "non-functional", "use case"] } },
-      { headers: { Authorization: `Bearer ${process.env.HF_TOKEN}` }, timeout: 15000 }
-    );
-    return { 
-      categories: res.data.labels.map((label, i) => ({
-        label,
-        score: res.data.scores[i]
-      })),
-      entities: extractEntities(text),
-      method: 'api'
-    };
-  } catch (err) {
-    throw new Error(`API Error: ${err.response?.status || err.code}`);
-  }
-}
-
-async function analyzeWithLocalModel(text) {
-  try {
-    const result = await LocalAnalyzer.analyze(text);
-    return {
-      categories: Array.isArray(result) ? result : [result],
-      entities: extractEntities(text),
-      method: 'local'
-    };
-  } catch (err) {
-    console.error('Local analysis fallback:', err.message);
-    return {
-      categories: [{ label: 'manual-review', score: 1 }],
-      entities: extractEntities(text),
-      method: 'fallback'
-    };
-  }
-}
-
 // Enhanced Test Generation
 function generateTestSteps(label, entities = []) {
   const roles = entities.filter(e => e.entity_group === 'ROLE');
@@ -218,7 +194,7 @@ function generateTestSteps(label, entities = []) {
     await page.click('button[type="submit"]');
     await expect(page).toHaveURL('http://localhost:3000/' + role + '-dashboard');
     ` : ''}
-    
+
     ${systems.some(s => s.word === 'database') ? `
     // System check
     const dbResponse = await page.request.get('http://localhost:3000/api/health');
@@ -229,25 +205,32 @@ function generateTestSteps(label, entities = []) {
 }
 
 function generateTestScript(analysis) {
-  // Basic test template
   let testCases = `
     const { test, expect } = require('@playwright/test');
+    const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
 
-    test.describe('Generated Tests', () => {
+    test.describe('Generated Tests from ${analysis.method}', () => {
   `;
 
-  // Add a test for each requirement
   analysis.categories.forEach((category, index) => {
+    const testName = `${category.label.replace(/\s+/g, '-').toLowerCase()}-${index}`;
+   
+
     testCases += `
-      test('${category.label} (${Math.round(category.score * 100)}%)', async ({ page }) => {
-        // Basic availability check
-        await page.goto('about:blank');
-        await expect(page).toHaveTitle('');
-        
-        // Add your specific test logic here
-        // Example:
-        // await page.goto('http://localhost:3000');
-        // await expect(page).toHaveURL('http://localhost:3000');
+      test('${category.label} ', async ({ page }) => {
+        // 1. Basic application availability check
+        const response = await page.request.get(BASE_URL);
+        await expect(response).toBeOK();
+
+        // 2. Navigate to page
+        await page.goto(BASE_URL);
+        await expect(page).toHaveURL(BASE_URL);
+
+        // 3. Basic content checks
+        await expect(page.locator('body')).not.toBeEmpty();
+
+        // 4. Category-specific checks
+        ${getCategorySpecificChecks(category.label)}
       });
     `;
   });
@@ -262,13 +245,44 @@ function generateTestScript(analysis) {
   };
 }
 
+function getCategorySpecificChecks(category) {
+  switch(category.toLowerCase()) {
+    case 'functional requirement':
+      return `
+        // Functional requirement checks
+        await expect(page).toHaveTitle(/./); // Title exists
+        const buttons = await page.locator('button').count();
+        await expect(buttons).toBeGreaterThan(0); // At least one button
+      `;
+    case 'non-functional requirement':
+      return `
+        // Performance check
+        const startTime = Date.now();
+        await page.reload();
+        const loadTime = Date.now() - startTime;
+        console.log('Page loaded in', loadTime, 'ms');
+        await expect(loadTime).toBeLessThan(2000); // Under 2 seconds
+      `;
+    case 'use case':
+      return `
+        // Use case validation
+        await expect(page.locator('a[href*="login"]')).toBeVisible();
+      `;
+    default:
+      return `
+        // Default validation
+        await expect(page.locator('body')).toBeVisible();
+      `;
+  }
+}
+
 // Routes
 app.post('/api/upload', upload.single('srsDocument'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
     const text = await extractText(req.file.path);
-    const analysis = await analyzeRequirements(text);
+    const analysis = await RemoteAnalyzer.analyze(text);
     const { script: testScript, status } = await generateTestScript(analysis);
 
     res.json({
@@ -294,88 +308,9 @@ app.post('/api/upload', upload.single('srsDocument'), async (req, res) => {
   }
 });
 
-async function analyzeRequirements(text) {
-  if (!text) throw new Error('No text to analyze');
-  try {
-    return await analyzeWithHuggingFace(text);
-  } catch (err) {
-    console.log('Falling back to local model:', err.message);
-    return await analyzeWithLocalModel(text);
-  }
-}
-
-app.post('/api/run-tests', async (req, res) => {
-  try {
-    const { testScript, documentName } = req.body;
-    
-    // 1. Create a temporary test file
-    const testId = Date.now();
-    const testFile = path.join(testDir, `test_${testId}.spec.js`);
-    const configFile = path.join(testDir, `playwright.config_${testId}.js`);
-    
-    // 2. Write test file with proper structure
-    fs.writeFileSync(testFile, `
-      const { test, expect } = require('@playwright/test');
-      ${testScript}
-    `);
-    
-    // 3. Write minimal Playwright config
-    fs.writeFileSync(configFile, `
-      module.exports = {
-        testDir: '.',
-        testMatch: '${path.basename(testFile)}',
-        timeout: 30000,
-        workers: 1
-      };
-    `);
-    
-    // 4. Execute tests
-    const command = `npx playwright test --config=${configFile}`;
-    const results = JSON.parse(execSync(command, { 
-      encoding: 'utf-8',
-      maxBuffer: 1024 * 1024 * 5 // 5MB
-    }));
-    
-    // 5. Clean up
-    fs.unlinkSync(testFile);
-    fs.unlinkSync(configFile);
-    
-    // 6. Save to MongoDB
-    const dbReady = mongoose.connection.readyState === 1;
-    if (dbReady) {
-      await TestRun.create({
-        documentName,
-        summary: {
-          passed: results.filter(t => t.status === 'passed').length,
-          failed: results.filter(t => t.status === 'failed').length,
-          total: results.length
-        },
-        details: results
-      });
-    }
-    
-    res.json({
-      summary: {
-        passed: results.filter(t => t.status === 'passed').length,
-        failed: results.filter(t => t.status === 'failed').length,
-        total: results.length
-      },
-      details: results
-    });
-    
-  } catch (error) {
-    console.error('Test execution error:', error);
-    res.status(500).json({
-      error: 'Test execution failed',
-      details: error.stderr || error.message
-    });
-  }
-});
 app.get('/api/test-history', async (req, res) => {
   try {
-    // Check MongoDB connection status
     const dbReady = mongoose.connection.readyState === 1;
-    
     if (!dbReady) {
       return res.status(503).json({
         error: 'Database not ready',
@@ -400,6 +335,38 @@ app.get('/api/test-history', async (req, res) => {
     });
   }
 });
+app.post('/api/run-tests', async (req, res) => {
+  try {
+    const { testScript, documentName } = req.body;
+    if (!testScript) return res.status(400).json({ error: 'No test script provided' });
+
+    // Define the path for the test script file
+    const testScriptFilePath = path.join(testDir, `${documentName}_test.spec.js`);
+
+    // Save the test script to the file
+    fs.writeFileSync(testScriptFilePath, testScript);
+
+    // Run the test script using Playwright
+    const result = await new Promise((resolve, reject) => {
+      exec(`npx playwright test ${testScriptFilePath}`, (error, stdout, stderr) => {
+        if (error) {
+          reject({ error, stderr });
+        } else {
+          resolve(stdout);
+        }
+      });
+    });
+
+    // Clean up the temporary file
+    fs.unlinkSync(testScriptFilePath);
+
+    // Send the result back to the frontend
+    res.json({ result });
+  } catch (err) {
+    console.error('Run tests error:', err.message);
+    res.status(500).json({ error: 'Failed to run tests', details: err.message });
+  }
+});
 
 app.get('/api/server-status', (req, res) => {
   res.json({
@@ -407,16 +374,13 @@ app.get('/api/server-status', (req, res) => {
     timestamp: new Date(),
     database: mongoose.STATES[mongoose.connection.readyState],
     services: {
-      huggingFace: !!process.env.HF_TOKEN,
       playwright: true
     }
   });
 });
 
-// Initialize
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`Hugging Face: ${process.env.HF_TOKEN ? 'Ready' : 'Not configured'}`);
   console.log('Playwright test generation enabled');
 });

@@ -4,7 +4,7 @@ const { pipeline } = require('@xenova/transformers');
 function sanitizeText(text) {
   if (typeof text !== 'string') {
     throw new Error('Input must be a string');
-  }
+  
   
   // Remove non-printable characters and excessive whitespace
   return text
