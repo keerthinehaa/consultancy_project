@@ -9,11 +9,13 @@ function Report() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
 
-  // Initialize Groq client
-  const groq = new Groq({
-    apiKey: process.env.GROQ_API_KEY,dangerouslyAllowBrowser: true
-  });
 
+
+  const groq = new Groq({
+    apiKey:"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",
+    dangerouslyAllowBrowser: true,
+  });
+  
   useEffect(() => {
     if (state?.requirements?.testScript) {
       analyzeTestScript(state.requirements.testScript);
