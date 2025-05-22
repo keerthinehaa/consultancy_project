@@ -12,7 +12,7 @@ function Report() {
 
 
   const groq = new Groq({
-    apiKey:"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",
+    apiKey:"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",
     dangerouslyAllowBrowser: true,
   });
   
